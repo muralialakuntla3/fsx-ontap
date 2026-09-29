@@ -602,25 +602,122 @@ class OntapClient:
             json=body,
         )
 
+    @staticmethod
+    def _is_open_access_principal(name: str | None) -> bool:
+        if not name:
+            return False
+        short = name.split("\\")[-1].strip().lower()
+        return short in {
+            "everyone",
+            "users",  # BUILTIN\Users
+            "authenticated users",
+        } or name.strip().upper() in {"S-1-1-0", "S-1-5-11", "S-1-5-32-545"}
+
+    @staticmethod
+    def _find_ace(acls: list[dict], user: str) -> dict | None:
+        wanted = (user or "").strip().lower()
+        wanted_short = wanted.split("\\")[-1]
+        for ace in acls:
+            name = (ace.get("user") or "").strip()
+            if not name:
+                continue
+            name_l = name.lower()
+            if name_l == wanted or name_l.split("\\")[-1] == wanted_short:
+                return ace
+        return None
+
+    @staticmethod
+    def _ace_delete_body(ace: dict) -> dict:
+        """
+        ONTAP requires the DELETE body to match the existing ACE.
+        Copy fields from GET, drop user + synchronize (known Everyone delete issue).
+        """
+        body: dict[str, Any] = {
+            "access": ace.get("access") or "access_allow",
+            "propagation_mode": "propagate",
+        }
+        access_control = ace.get("access_control") or "file_directory"
+        body["access_control"] = str(access_control).replace("-", "_")
+
+        apply_to = ace.get("apply_to")
+        if isinstance(apply_to, dict) and apply_to:
+            body["apply_to"] = {k: bool(v) for k, v in apply_to.items() if v is not None}
+        else:
+            body["apply_to"] = dict(APPLY_TO_ALL)
+
+        # Prefer rights shorthand when present; otherwise mirror advanced_rights.
+        if ace.get("rights"):
+            body["rights"] = ace["rights"]
+        else:
+            adv = ace.get("advanced_rights") or {}
+            cleaned = {
+                k: True
+                for k, v in adv.items()
+                if v is True and k != "synchronize"
+            }
+            if cleaned:
+                body["advanced_rights"] = cleaned
+        return body
+
     async def remove_path_acl(self, svm_name: str, path: str, user: str) -> Any:
         svm = await self.resolve_svm(svm_name)
+        perms = await self.get_path_permissions(svm_name, path)
+        acls = perms.get("acls") or []
+        ace = self._find_ace(acls, user)
+        if not ace:
+            raise OntapApiError(
+                404,
+                f"ACL entry for '{user}' was not found on path '{path}'",
+            )
+
+        actual_user = ace.get("user") or user
         api_path = (
             f"/protocols/file-security/permissions/"
             f"{quote(svm['uuid'], safe='')}/{self.encode_fs_path(path)}/acl/"
-            f"{quote(user, safe='')}"
+            f"{quote(actual_user, safe='')}"
         )
-        body = {
-            "access": "access_allow",
-            "access_control": "file_directory",
-            "apply_to": APPLY_TO_ALL,
-            "propagation_mode": "propagate",
-        }
-        return await self._request_job(
-            "DELETE",
-            api_path,
-            params={"return_timeout": 0},
-            json=body,
-        )
+        body = self._ace_delete_body(ace)
+
+        try:
+            return await self._request_job(
+                "DELETE",
+                api_path,
+                params={"return_timeout": 0},
+                json=body,
+            )
+        except OntapApiError as first_exc:
+            # Retry with minimal body (access + apply_to only) — some builds are picky.
+            minimal = {
+                "access": body["access"],
+                "access_control": body["access_control"],
+                "apply_to": body["apply_to"],
+                "propagation_mode": "propagate",
+            }
+            try:
+                return await self._request_job(
+                    "DELETE",
+                    api_path,
+                    params={"return_timeout": 0},
+                    json=minimal,
+                )
+            except OntapApiError:
+                raise first_exc
+
+    async def remove_open_access_acls(self, svm_name: str, path: str) -> list[str]:
+        """Remove Everyone / BUILTIN\\Users / Authenticated Users ACEs when present."""
+        perms = await self.get_path_permissions(svm_name, path)
+        removed: list[str] = []
+        for ace in list(perms.get("acls") or []):
+            user = ace.get("user")
+            if not self._is_open_access_principal(user):
+                continue
+            try:
+                await self.remove_path_acl(svm_name, path, user)
+                removed.append(user)
+            except OntapApiError:
+                # Continue removing other open-access principals.
+                continue
+        return removed
 
     @staticmethod
     def _summarize_ace(ace: dict) -> str:
@@ -655,19 +752,17 @@ class OntapClient:
         perms = await self.get_path_permissions(svm_name, path)
         attached: list[dict] = []
         for ace in perms.get("acls") or []:
-            user = ace.get("user") or ace.get("access_control") or ""
-            if not user or str(user).upper().startswith("BUILTIN\\"):
-                # Still show BUILTIN entries so admins can see them
-                pass
+            user = ace.get("user")
             attached.append(
                 {
-                    "user_or_group": ace.get("user"),
+                    "user_or_group": user,
                     "access": ace.get("access"),
                     "permission": self._summarize_ace(ace),
                     "path": path,
                     "volume": volume.get("name"),
                     "volume_uuid": volume.get("uuid"),
                     "apply_to": ace.get("apply_to"),
+                    "open_access": self._is_open_access_principal(user),
                 }
             )
         return attached
@@ -709,6 +804,7 @@ class OntapClient:
         volume_uuid: str,
         group_name: str,
         permission: str,
+        remove_open_access: bool = True,
     ) -> dict:
         volume = await self.get_volume(volume_uuid)
         path = (volume.get("nas") or {}).get("path")
@@ -721,6 +817,9 @@ class OntapClient:
         cifs = await self.get_cifs_server(svm_name)
         account = self.local_group_account(cifs["name"], group_name)
         await self.add_path_acl(svm_name, path, account, permission)
+        removed_open: list[str] = []
+        if remove_open_access:
+            removed_open = await self.remove_open_access_acls(svm_name, path)
         return {
             "volume": volume.get("name"),
             "volume_uuid": volume_uuid,
@@ -728,6 +827,7 @@ class OntapClient:
             "user_or_group": account,
             "permission": permission,
             "cifs_server": cifs.get("name"),
+            "removed_open_access": removed_open,
         }
 
     async def detach_group_from_volume(

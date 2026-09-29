@@ -527,10 +527,11 @@ async function viewVolume(uuid) {
     }
     const v = await api(`/api/volumes/${encodeURIComponent(uuid)}?svm=${svm()}`);
     const groupsAttached = v.attached_groups || [];
+    const hasOpenAccess = groupsAttached.some(g => g.open_access);
     const groupRows = groupsAttached.length
       ? `<table><thead><tr><th>Group / User</th><th>Permission</th><th>Path</th><th></th></tr></thead><tbody>
-          ${groupsAttached.map(g => `<tr>
-            <td><code>${escapeHtml(g.user_or_group || "")}</code></td>
+          ${groupsAttached.map(g => `<tr class="${g.open_access ? "warn-row" : ""}">
+            <td><code>${escapeHtml(g.user_or_group || "")}</code>${g.open_access ? ` <span class="chip warn">open access</span>` : ""}</td>
             <td>${escapeHtml(g.permission || "")}</td>
             <td><code>${escapeHtml(g.path || "")}</code></td>
             <td>
@@ -556,14 +557,18 @@ async function viewVolume(uuid) {
 
       <div class="section-block">
         <h3>Attached groups (NTFS file-security ACL)</h3>
+        ${hasOpenAccess ? `<p class="alert error">This path still allows Everyone/Users — remove open access or the volume stays world-readable.</p>` : ""}
         ${groupRows}
         ${!(v.nas && v.nas.path) ? `<p class="hint">This volume has no junction path — set one before attaching group permissions.</p>` : `
+        <div class="toolbar-actions" style="margin:12px 0;">
+          <button class="danger" type="button" onclick="removeOpenAccess('${escapeHtml(uuid)}')">Remove Everyone / open access</button>
+        </div>
         <form class="inline-form" onsubmit="attachVolumePermission(event, '${escapeHtml(uuid)}')">
           <label>Group<select id="volGroup" required>${groupOptions}</select></label>
           <label>Permission<select id="volPermission" required>${ntfsPermissionOptions("modify")}</select></label>
           <button class="primary" type="submit">Attach group</button>
         </form>
-        <p class="hint">Applies <code>CIFS_SERVER\\group</code> with Modify or Read-and-Execute rights on the junction path.</p>`}
+        <p class="hint">Attaching a group also tries to remove Everyone/BUILTIN\\Users automatically.</p>`}
       </div>
     `);
   } catch (e) { showAlert(e.message, true); }
@@ -592,6 +597,18 @@ async function removeVolumePermission(uuid, userOrGroup) {
       { method: "DELETE" }
     );
     showAlert("ACL entry removed");
+    await viewVolume(uuid);
+  } catch (e) { showAlert(e.message, true); }
+}
+
+async function removeOpenAccess(uuid) {
+  if (!confirm("Remove Everyone / BUILTIN\\Users / Authenticated Users from this volume path?")) return;
+  try {
+    const result = await api(
+      `/api/volumes/${encodeURIComponent(uuid)}/permissions/remove-open-access?svm=${svm()}`,
+      { method: "POST" }
+    );
+    showAlert(result.message || "Open access removed");
     await viewVolume(uuid);
   } catch (e) { showAlert(e.message, true); }
 }

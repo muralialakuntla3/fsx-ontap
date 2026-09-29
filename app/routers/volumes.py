@@ -131,3 +131,26 @@ async def remove_group_permission(
         return {"message": f"Removed '{user_or_group}' from volume"}
     except OntapApiError as exc:
         handle_error(exc)
+
+
+@router.post("/{uuid}/permissions/remove-open-access")
+async def remove_open_access(uuid: str, svm: str):
+    """Remove Everyone / BUILTIN\\Users / Authenticated Users ACEs from the volume path."""
+    try:
+        c = client()
+        volume = await c.get_volume(uuid)
+        path = (volume.get("nas") or {}).get("path")
+        if not path:
+            raise HTTPException(status_code=400, detail="Volume has no junction path")
+        removed = await c.remove_open_access_acls(svm, path)
+        return {
+            "path": path,
+            "removed": removed,
+            "message": (
+                f"Removed open-access entries: {', '.join(removed)}"
+                if removed
+                else "No Everyone/Users open-access ACEs found"
+            ),
+        }
+    except OntapApiError as exc:
+        handle_error(exc)
