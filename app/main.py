@@ -4,15 +4,17 @@ from fastapi.staticfiles import StaticFiles
 
 from app.routers.groups import router as groups_router
 from app.routers.system import router as system_router
+from app.routers.volumes import router as volumes_router
 
 app = FastAPI(
     title="FSx ONTAP Local Group Manager",
-    version="1.0.0",
-    description="CRUD UI/API for CIFS local groups on FSx for ONTAP."
+    version="1.1.0",
+    description="CRUD UI/API for CIFS local groups, privileges, and volumes on FSx for ONTAP."
 )
 
 app.include_router(system_router, prefix="/api")
 app.include_router(groups_router, prefix="/api")
+app.include_router(volumes_router, prefix="/api")
 
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 

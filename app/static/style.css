@@ -5,11 +5,41 @@ header { background: #172033; color: white; padding: 20px 5%; display:flex; just
 header h1 { margin:0 0 5px; font-size:24px; }
 header p { margin:0; opacity:.8; }
 header a { color:white; }
+
+.topnav {
+  background:#243047;
+  color:white;
+  padding:0 5%;
+  display:flex;
+  gap:8px;
+  align-items:center;
+  flex-wrap:wrap;
+  border-bottom:1px solid #31405c;
+}
+.nav-btn {
+  background:transparent;
+  color:#d7deed;
+  border:0;
+  border-radius:0;
+  padding:14px 16px;
+  border-bottom:3px solid transparent;
+}
+.nav-btn.active {
+  color:white;
+  border-bottom-color:#60a5fa;
+  background:#1c273b;
+}
+.nav-svm { margin-left:auto; padding:8px 0; }
+.nav-svm label { margin:0; color:#d7deed; font-size:13px; min-width:280px; }
+.nav-svm select { margin-top:4px; background:white; color:#172033; }
+
 main { max-width:1200px; margin:30px auto; padding:0 20px; }
-.toolbar { display:flex; gap:12px; align-items:end; margin-bottom:20px; }
+.toolbar { display:flex; gap:12px; align-items:center; justify-content:space-between; margin-bottom:20px; flex-wrap:wrap; }
+.toolbar h2 { margin:0; }
+.toolbar-actions { display:flex; gap:10px; }
 label { display:block; font-weight:600; margin-bottom:14px; }
 input, textarea, select { display:block; width:100%; margin-top:6px; padding:10px; border:1px solid #ccd3df; border-radius:7px; font:inherit; }
-.toolbar label { min-width:420px; margin:0; }
+select[multiple] { min-height:140px; }
 button { border:0; border-radius:7px; padding:9px 14px; cursor:pointer; background:#e7ebf2; }
 button.primary { background:#2563eb; color:white; }
 button.danger { background:#dc2626; color:white; }
@@ -21,19 +51,27 @@ code { font-size:12px; word-break:break-all; }
 .alert { padding:12px; margin-bottom:15px; border-radius:8px; }
 .success { background:#dcfce7; color:#166534; }
 .error { background:#fee2e2; color:#991b1b; }
-.modal { position:fixed; inset:0; background:#0008; display:flex; justify-content:center; align-items:center; padding:20px; }
-.hidden { display:none; }
-.dialog { background:white; width:min(650px,100%); max-height:90vh; overflow:auto; border-radius:12px; padding:22px; }
+.modal { position:fixed; inset:0; background:#0008; display:flex; justify-content:center; align-items:center; padding:20px; z-index:20; }
+.hidden { display:none !important; }
+.dialog { background:white; width:min(760px,100%); max-height:90vh; overflow:auto; border-radius:12px; padding:22px; }
 .dialog-head { display:flex; justify-content:space-between; align-items:center; }
 .dialog-head h2 { margin-top:0; }
 .dialog-head button { font-size:22px; padding:2px 9px; }
-.members { list-style:none; padding:0; }
-.members li { display:flex; justify-content:space-between; gap:12px; padding:9px; border-bottom:1px solid #eee; }
-.member-form { display:flex; gap:8px; align-items:end; margin-top:15px; }
-.member-form input { flex:1; }
+.members, .plain-list { list-style:none; padding:0; margin:0; }
+.members li, .plain-list li { display:flex; justify-content:space-between; gap:12px; padding:9px; border-bottom:1px solid #eee; align-items:center; }
+.member-form, .inline-form { display:flex; gap:8px; align-items:end; margin-top:15px; flex-wrap:wrap; }
+.member-form input, .inline-form input, .inline-form select { flex:1; min-width:160px; }
 .muted { color:#667085; }
+.details p { margin:8px 0; }
+.section-block { margin-top:22px; }
+.section-block h3 { margin:0 0 10px; }
+.chip-row { display:flex; flex-wrap:wrap; gap:8px; }
+.chip { background:#eef2ff; color:#3730a3; padding:5px 10px; border-radius:999px; font-size:12px; }
+.hint { font-size:12px; color:#667085; font-weight:400; margin-top:4px; }
+.grid-2 { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
 @media(max-width:700px) {
-  .toolbar { flex-direction:column; align-items:stretch; }
-  .toolbar label { min-width:0; }
-  .member-form { flex-direction:column; align-items:stretch; }
+  .nav-svm { margin-left:0; width:100%; }
+  .nav-svm label { min-width:0; width:100%; }
+  .member-form, .inline-form { flex-direction:column; align-items:stretch; }
+  .grid-2 { grid-template-columns:1fr; }
 }

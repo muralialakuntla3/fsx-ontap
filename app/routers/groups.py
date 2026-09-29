@@ -1,8 +1,8 @@
 from fastapi import APIRouter, HTTPException, Query
 
 from app.config import get_settings
-from app.models import GroupCreate, GroupUpdate, MemberAdd
-from app.ontap_client import OntapApiError, OntapClient
+from app.models import GroupCreate, GroupUpdate, MemberAdd, PrivilegesUpdate
+from app.ontap_client import AVAILABLE_PRIVILEGES, OntapApiError, OntapClient
 
 router = APIRouter(prefix="/groups", tags=["groups"])
 
@@ -13,6 +13,11 @@ def client() -> OntapClient:
 
 def handle_error(exc: OntapApiError):
     raise HTTPException(status_code=exc.status_code, detail=exc.message)
+
+
+@router.get("/meta/privileges")
+async def list_available_privileges():
+    return {"records": AVAILABLE_PRIVILEGES}
 
 
 @router.get("")
@@ -26,7 +31,13 @@ async def list_groups(svm: str = Query(..., description="SVM name")):
 @router.post("", status_code=201)
 async def create_group(svm: str, payload: GroupCreate):
     try:
-        return await client().create_group(svm, payload.name, payload.description)
+        c = client()
+        group = await c.create_group(svm, payload.name, payload.description)
+        if payload.privileges:
+            group["privileges"] = await c.set_privileges(svm, group["name"], payload.privileges)
+        else:
+            group["privileges"] = []
+        return group
     except OntapApiError as exc:
         handle_error(exc)
 
@@ -34,8 +45,13 @@ async def create_group(svm: str, payload: GroupCreate):
 @router.get("/{sid}")
 async def get_group(svm: str, sid: str):
     try:
-        group = await client().get_group(svm, sid)
-        group["members"] = await client().list_members(svm, sid)
+        c = client()
+        group = await c.get_group(svm, sid)
+        group["members"] = await c.list_members(svm, sid)
+        group["privileges"] = await c.get_privileges(svm, group["name"])
+        group["attached_volumes"] = await c.group_attached_volumes(
+            svm, group["name"], group.get("sid")
+        )
         return group
     except OntapApiError as exc:
         handle_error(exc)
@@ -44,7 +60,13 @@ async def get_group(svm: str, sid: str):
 @router.patch("/{sid}")
 async def update_group(svm: str, sid: str, payload: GroupUpdate):
     try:
-        return await client().update_group(svm, sid, payload.name, payload.description)
+        c = client()
+        group = await c.update_group(svm, sid, payload.name, payload.description)
+        if payload.privileges is not None:
+            group["privileges"] = await c.set_privileges(svm, group["name"], payload.privileges)
+        else:
+            group["privileges"] = await c.get_privileges(svm, group["name"])
+        return group
     except OntapApiError as exc:
         handle_error(exc)
 
@@ -79,5 +101,27 @@ async def remove_member(svm: str, sid: str, name: str = Query(...)):
     try:
         await client().remove_member(svm, sid, name)
         return {"message": f"Member '{name}' removed"}
+    except OntapApiError as exc:
+        handle_error(exc)
+
+
+@router.get("/{sid}/privileges")
+async def get_group_privileges(svm: str, sid: str):
+    try:
+        c = client()
+        group = await c.get_group(svm, sid)
+        privileges = await c.get_privileges(svm, group["name"])
+        return {"name": group["name"], "privileges": privileges}
+    except OntapApiError as exc:
+        handle_error(exc)
+
+
+@router.put("/{sid}/privileges")
+async def update_group_privileges(svm: str, sid: str, payload: PrivilegesUpdate):
+    try:
+        c = client()
+        group = await c.get_group(svm, sid)
+        privileges = await c.set_privileges(svm, group["name"], payload.privileges)
+        return {"name": group["name"], "privileges": privileges}
     except OntapApiError as exc:
         handle_error(exc)

@@ -10,29 +10,64 @@
 <header>
   <div>
     <h1>FSx ONTAP Local Group Manager</h1>
-    <p>CIFS local groups, AD users/groups and local users</p>
+    <p>CIFS local groups, privileges, members, and volumes</p>
   </div>
   <a href="/docs" target="_blank">API Docs</a>
 </header>
 
-<main>
-  <section class="toolbar">
+<nav class="topnav" aria-label="Primary">
+  <button class="nav-btn active" data-section="groups" onclick="showSection('groups')">Groups</button>
+  <button class="nav-btn" data-section="volumes" onclick="showSection('volumes')">Volumes</button>
+  <div class="nav-svm">
     <label>SVM
       <select id="svm"></select>
     </label>
-    <button onclick="loadGroups()">Refresh</button>
-    <button class="primary" onclick="openCreate()">+ Create Group</button>
-  </section>
+  </div>
+</nav>
 
+<main>
   <div id="alert"></div>
 
-  <section class="card">
-    <table>
-      <thead>
-        <tr><th>Group</th><th>Description</th><th>SID</th><th>Actions</th></tr>
-      </thead>
-      <tbody id="groups"></tbody>
-    </table>
+  <section id="section-groups" class="page-section">
+    <div class="toolbar">
+      <h2>Local Groups</h2>
+      <div class="toolbar-actions">
+        <button onclick="loadGroups()">Refresh</button>
+        <button class="primary" onclick="openCreate()">+ Create Group</button>
+      </div>
+    </div>
+    <section class="card">
+      <table>
+        <thead>
+          <tr><th>Group</th><th>Description</th><th>SID</th><th>Actions</th></tr>
+        </thead>
+        <tbody id="groups"></tbody>
+      </table>
+    </section>
+  </section>
+
+  <section id="section-volumes" class="page-section hidden">
+    <div class="toolbar">
+      <h2>Volumes</h2>
+      <div class="toolbar-actions">
+        <button onclick="loadVolumes()">Refresh</button>
+        <button class="primary" onclick="openCreateVolume()">+ Create Volume</button>
+      </div>
+    </div>
+    <section class="card">
+      <table>
+        <thead>
+          <tr>
+            <th>Volume</th>
+            <th>Size</th>
+            <th>State</th>
+            <th>Junction</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="volumes"></tbody>
+      </table>
+    </section>
   </section>
 </main>
 
