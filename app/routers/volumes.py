@@ -1,8 +1,8 @@
 from fastapi import APIRouter, HTTPException, Query
 
 from app.config import get_settings
-from app.models import ShareAclCreate, ShareAclUpdate, VolumeCreate, VolumeUpdate
-from app.ontap_client import SHARE_PERMISSIONS, OntapApiError, OntapClient
+from app.models import VolumeCreate, VolumePermissionAttach, VolumeUpdate
+from app.ontap_client import NTFS_PERMISSION_PRESETS, OntapApiError, OntapClient
 
 router = APIRouter(prefix="/volumes", tags=["volumes"])
 
@@ -16,33 +16,26 @@ def handle_error(exc: OntapApiError):
 
 
 @router.get("/meta/permissions")
-async def list_share_permissions():
-    return {"records": SHARE_PERMISSIONS}
+async def list_ntfs_permissions():
+    return {
+        "records": [
+            {"value": p["value"], "label": p["label"]} for p in NTFS_PERMISSION_PRESETS
+        ]
+    }
 
 
 @router.get("/meta/aggregates")
-async def list_aggregates():
+async def list_aggregates(svm: str | None = Query(None)):
     try:
-        return {"records": await client().list_aggregates()}
-    except OntapApiError as exc:
-        handle_error(exc)
-
-
-@router.get("/meta/shares")
-async def list_shares(svm: str = Query(..., description="SVM name")):
-    try:
-        return {"records": await client().list_shares(svm)}
-    except OntapApiError as exc:
-        handle_error(exc)
-
-
-@router.post("/meta/shares/{share}/acls", status_code=201)
-async def create_share_acl(share: str, svm: str, payload: ShareAclCreate):
-    try:
-        await client().add_share_acl(
-            svm, share, payload.user_or_group, payload.permission, payload.type
-        )
-        return {"message": f"Attached '{payload.user_or_group}' to share '{share}'"}
+        c = client()
+        if svm:
+            records = await c.list_aggregates_for_svm(svm)
+        else:
+            try:
+                records = await c.list_aggregates()
+            except OntapApiError:
+                records = []
+        return {"records": records}
     except OntapApiError as exc:
         handle_error(exc)
 
@@ -76,12 +69,7 @@ async def get_volume(uuid: str, svm: str = Query(..., description="SVM name")):
     try:
         c = client()
         volume = await c.get_volume(uuid)
-        volume["attached_groups"] = await c.volume_attached_groups(svm, volume["name"])
-        volume["shares"] = [
-            s for s in await c.list_shares(svm)
-            if (s.get("volume") or {}).get("uuid") == uuid
-            or (s.get("volume") or {}).get("name") == volume.get("name")
-        ]
+        volume["attached_groups"] = await c.volume_attached_groups(svm, volume)
         return volume
     except OntapApiError as exc:
         handle_error(exc)
@@ -115,70 +103,31 @@ async def list_volume_groups(uuid: str, svm: str = Query(...)):
     try:
         c = client()
         volume = await c.get_volume(uuid)
-        return {"records": await c.volume_attached_groups(svm, volume["name"])}
+        return {"records": await c.volume_attached_groups(svm, volume)}
     except OntapApiError as exc:
         handle_error(exc)
 
 
-@router.post("/{uuid}/acls", status_code=201)
-async def attach_group_to_volume(
-    uuid: str,
-    svm: str,
-    payload: ShareAclCreate,
-    share: str = Query(..., description="CIFS share name on this volume"),
-):
+@router.post("/{uuid}/permissions", status_code=201)
+async def attach_group_permission(uuid: str, svm: str, payload: VolumePermissionAttach):
     try:
         c = client()
-        volume = await c.get_volume(uuid)
-        shares = await c.list_shares(svm)
-        match = next(
-            (
-                s for s in shares
-                if s.get("name") == share
-                and (
-                    (s.get("volume") or {}).get("uuid") == uuid
-                    or (s.get("volume") or {}).get("name") == volume.get("name")
-                )
-            ),
-            None,
-        )
-        if not match:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Share '{share}' was not found on volume '{volume.get('name')}'",
-            )
-        await c.add_share_acl(svm, share, payload.user_or_group, payload.permission, payload.type)
-        return {"message": f"Attached '{payload.user_or_group}' to share '{share}'"}
+        group_name = payload.group_name
+        if not group_name:
+            raise HTTPException(status_code=400, detail="group_name is required")
+        return await c.attach_group_to_volume(svm, uuid, group_name, payload.permission)
     except OntapApiError as exc:
         handle_error(exc)
 
 
-@router.patch("/{uuid}/acls")
-async def update_volume_acl(
+@router.delete("/{uuid}/permissions")
+async def remove_group_permission(
     uuid: str,
     svm: str,
-    payload: ShareAclUpdate,
-    share: str = Query(...),
     user_or_group: str = Query(...),
-    acl_type: str = Query("windows"),
 ):
     try:
-        await client().update_share_acl(svm, share, user_or_group, payload.permission, acl_type)
-        return {"message": f"Updated ACL for '{user_or_group}' on share '{share}'"}
-    except OntapApiError as exc:
-        handle_error(exc)
-
-
-@router.delete("/{uuid}/acls")
-async def remove_volume_acl(
-    uuid: str,
-    svm: str,
-    share: str = Query(...),
-    user_or_group: str = Query(...),
-    acl_type: str = Query("windows"),
-):
-    try:
-        await client().remove_share_acl(svm, share, user_or_group, acl_type)
-        return {"message": f"Removed ACL for '{user_or_group}' from share '{share}'"}
+        await client().detach_group_from_volume(svm, uuid, user_or_group)
+        return {"message": f"Removed '{user_or_group}' from volume"}
     except OntapApiError as exc:
         handle_error(exc)

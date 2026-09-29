@@ -1,7 +1,7 @@
 let groups = [];
 let volumes = [];
 let availablePrivileges = [];
-let sharePermissions = [];
+let ntfsPermissions = [];
 let aggregates = [];
 let selectedGroup = null;
 let currentSection = "groups";
@@ -27,7 +27,7 @@ async function api(url, options = {}) {
 
 function showAlert(message, error=false) {
   $("alert").innerHTML = `<div class="alert ${error ? "error" : "success"}">${escapeHtml(message)}</div>`;
-  setTimeout(() => $("alert").innerHTML = "", 5000);
+  setTimeout(() => $("alert").innerHTML = "", 7000);
 }
 
 function escapeHtml(value) {
@@ -68,14 +68,22 @@ async function loadSvms() {
 }
 
 async function loadMeta() {
-  const [privs, perms, aggs] = await Promise.all([
+  const [privs, perms] = await Promise.all([
     api("/api/groups/meta/privileges"),
-    api("/api/volumes/meta/permissions"),
-    api("/api/volumes/meta/aggregates").catch(() => ({records: []}))
+    api("/api/groups/meta/permissions")
   ]);
   availablePrivileges = privs.records || [];
-  sharePermissions = perms.records || [];
-  aggregates = aggs.records || [];
+  ntfsPermissions = perms.records || [];
+  await loadAggregates();
+}
+
+async function loadAggregates() {
+  try {
+    const data = await api(`/api/volumes/meta/aggregates?svm=${svm()}`);
+    aggregates = data.records || [];
+  } catch (_) {
+    aggregates = [];
+  }
 }
 
 function privilegeOptions(selected = []) {
@@ -85,10 +93,18 @@ function privilegeOptions(selected = []) {
   ).join("");
 }
 
-function permissionOptions(selected = "") {
-  return sharePermissions.map(p =>
+function ntfsPermissionOptions(selected = "modify") {
+  return ntfsPermissions.map(p =>
     `<option value="${escapeHtml(p.value)}" ${selected === p.value ? "selected" : ""}>${escapeHtml(p.label)}</option>`
   ).join("");
+}
+
+function volumeOptions(selected = "") {
+  return (volumes.length ? volumes : []).map(v => {
+    const path = (v.nas && v.nas.path) || "";
+    const label = path ? `${v.name} (${path})` : v.name;
+    return `<option value="${escapeHtml(v.uuid)}" ${selected === v.uuid ? "selected" : ""}>${escapeHtml(label)}</option>`;
+  }).join("") || `<option value="">No volumes found</option>`;
 }
 
 function formatSize(bytes) {
@@ -103,6 +119,17 @@ function formatSize(bytes) {
     i += 1;
   }
   return `${value.toFixed(value >= 10 || i === 0 ? 0 : 1)} ${units[i]}`;
+}
+
+async function ensureVolumesLoaded() {
+  if (!volumes.length) {
+    try {
+      const data = await api(`/api/volumes?svm=${svm()}`);
+      volumes = data.records || [];
+    } catch (_) {
+      volumes = [];
+    }
+  }
 }
 
 async function loadGroups() {
@@ -140,12 +167,25 @@ function closeModal() {
   selectedGroup = null;
 }
 
-function openCreate() {
+async function openCreate() {
+  await ensureVolumesLoaded();
   openModal("Create Local Group", `
     <form onsubmit="createGroup(event)">
-      <label>Group name<input id="groupName" required maxlength="256"></label>
-      <label>Description<textarea id="groupDescription" maxlength="1024"></textarea></label>
-      <label>ONTAP privileges
+      <label>Group name<input id="groupName" required maxlength="256" placeholder="FSX-Project1-RW"></label>
+      <label>Description<textarea id="groupDescription" maxlength="1024" placeholder="Project1 Read Write"></textarea></label>
+      <div class="grid-2">
+        <label>Attach to volume (optional)
+          <select id="createVolume">
+            <option value="">— None —</option>
+            ${volumeOptions()}
+          </select>
+        </label>
+        <label>NTFS permission
+          <select id="createPermission">${ntfsPermissionOptions("modify")}</select>
+        </label>
+      </div>
+      <p class="hint">Uses file-security ACL on the volume junction path as <code>CIFS_SERVER\\group</code> (per FSx Permissions runbook).</p>
+      <label>ONTAP privileges (optional)
         <span class="hint">Hold Ctrl/Cmd to select multiple</span>
         <select id="groupPrivileges" multiple>${privilegeOptions()}</select>
       </label>
@@ -155,19 +195,26 @@ function openCreate() {
 }
 
 function selectedPrivileges(id) {
-  return Array.from($(id).selectedOptions).map(o => o.value);
+  const el = $(id);
+  if (!el) return [];
+  return Array.from(el.selectedOptions).map(o => o.value);
 }
 
 async function createGroup(event) {
   event.preventDefault();
   try {
+    const body = {
+      name: $("groupName").value,
+      description: $("groupDescription").value || null,
+      privileges: selectedPrivileges("groupPrivileges")
+    };
+    if ($("createVolume").value) {
+      body.volume_uuid = $("createVolume").value;
+      body.permission = $("createPermission").value;
+    }
     await api(`/api/groups?svm=${svm()}`, {
       method: "POST",
-      body: JSON.stringify({
-        name: $("groupName").value,
-        description: $("groupDescription").value || null,
-        privileges: selectedPrivileges("groupPrivileges")
-      })
+      body: JSON.stringify(body)
     });
     closeModal();
     showAlert("Group created");
@@ -177,26 +224,32 @@ async function createGroup(event) {
 
 async function viewGroup(sid) {
   try {
+    await ensureVolumesLoaded();
     const g = await api(`/api/groups/${encodeURIComponent(sid)}?svm=${svm()}`);
     selectedGroup = g;
     const privChips = (g.privileges || []).length
       ? `<div class="chip-row">${g.privileges.map(p => `<span class="chip">${escapeHtml(p)}</span>`).join("")}</div>`
-      : `<p class="muted">No privileges assigned.</p>`;
+      : `<p class="muted">No Se* privileges assigned.</p>`;
     const vols = g.attached_volumes || [];
     const volRows = vols.length
-      ? `<table><thead><tr><th>Volume</th><th>Share</th><th>Permission</th></tr></thead><tbody>
+      ? `<table><thead><tr><th>Volume</th><th>Path</th><th>Account</th><th>Permission</th><th></th></tr></thead><tbody>
           ${vols.map(v => `<tr>
             <td>${escapeHtml(v.volume || "—")}</td>
-            <td>${escapeHtml(v.share || "")}</td>
+            <td><code>${escapeHtml(v.path || "")}</code></td>
+            <td><code>${escapeHtml(v.user_or_group || "")}</code></td>
             <td>${escapeHtml(v.permission || "")}</td>
+            <td>
+              <button class="danger small" onclick="detachGroupVolume('${escapeHtml(g.sid)}', '${escapeHtml(v.volume_uuid)}', '${escapeHtml(v.user_or_group)}')">Remove</button>
+            </td>
           </tr>`).join("")}
         </tbody></table>`
-      : `<p class="muted">No CIFS share ACLs attach this group to a volume yet.</p>`;
+      : `<p class="muted">No volumes have this group in their NTFS ACL yet.</p>`;
 
     openModal(g.name, `
       <div class="details">
         <p><b>Description:</b> ${escapeHtml(g.description || "")}</p>
         <p><b>SID:</b> <code>${escapeHtml(g.sid)}</code></p>
+        <p><b>CIFS local account:</b> <code>${escapeHtml(g.local_account || g.name)}</code></p>
       </div>
 
       <div class="section-block">
@@ -209,7 +262,25 @@ async function viewGroup(sid) {
       </div>
 
       <div class="section-block">
-        <h3>ONTAP privileges</h3>
+        <h3>Attached volumes (NTFS permissions)</h3>
+        ${volRows}
+        <form class="inline-form" onsubmit="attachGroupVolume(event, '${escapeHtml(g.sid)}')">
+          <label>Volume
+            <select id="attachVolume" required>
+              <option value="">Select volume…</option>
+              ${volumeOptions()}
+            </select>
+          </label>
+          <label>Permission
+            <select id="attachPermission" required>${ntfsPermissionOptions("modify")}</select>
+          </label>
+          <button class="primary" type="submit">Attach to volume</button>
+        </form>
+        <p class="hint">Applies file-security ACL on the volume junction path using <code>${escapeHtml(g.local_account || "CIFS_SERVER\\\\group")}</code>.</p>
+      </div>
+
+      <div class="section-block">
+        <h3>ONTAP privileges (optional)</h3>
         <div id="privDisplay">${privChips}</div>
         <form class="section-block" onsubmit="saveGroupPrivileges(event, '${escapeHtml(g.sid)}')">
           <label>Modify privileges
@@ -218,37 +289,8 @@ async function viewGroup(sid) {
           <button class="primary" type="submit">Save Privileges</button>
         </form>
       </div>
-
-      <div class="section-block">
-        <h3>Attached volumes</h3>
-        ${volRows}
-        <form class="inline-form" onsubmit="attachGroupToShare(event, '${escapeHtml(g.name)}')">
-          <label>Share
-            <select id="attachShare" required></select>
-          </label>
-          <label>Permission
-            <select id="attachPermission" required>${permissionOptions("read")}</select>
-          </label>
-          <button class="primary" type="submit">Attach to volume share</button>
-        </form>
-        <p class="hint">Attaches this group to a CIFS share ACL (volume linkage).</p>
-      </div>
     `);
-    await populateShareSelect("attachShare");
   } catch (e) { showAlert(e.message, true); }
-}
-
-async function populateShareSelect(selectId, volumeName = null) {
-  const data = await api(`/api/volumes/meta/shares?svm=${svm()}`);
-  const select = $(selectId);
-  const records = (data.records || []).filter(s => {
-    if (!volumeName) return true;
-    return (s.volume || {}).name === volumeName;
-  });
-  select.innerHTML = records.map(s => {
-    const vol = (s.volume || {}).name || "—";
-    return `<option value="${escapeHtml(s.name)}">${escapeHtml(s.name)} → ${escapeHtml(vol)} (${escapeHtml(s.path || "")})</option>`;
-  }).join("") || `<option value="">No shares found</option>`;
 }
 
 function renderMembers(members) {
@@ -294,24 +336,34 @@ async function saveGroupPrivileges(event, sid) {
   } catch (e) { showAlert(e.message, true); }
 }
 
-async function attachGroupToShare(event, groupName) {
+async function attachGroupVolume(event, sid) {
   event.preventDefault();
-  const share = $("attachShare").value;
-  if (!share) {
-    showAlert("Select a CIFS share first", true);
+  const volumeUuid = $("attachVolume").value;
+  if (!volumeUuid) {
+    showAlert("Select a volume", true);
     return;
   }
   try {
-    await api(`/api/volumes/meta/shares/${encodeURIComponent(share)}/acls?svm=${svm()}`, {
+    await api(`/api/groups/${encodeURIComponent(sid)}/volume-permissions?svm=${svm()}`, {
       method: "POST",
       body: JSON.stringify({
-        user_or_group: groupName,
-        permission: $("attachPermission").value,
-        type: "windows"
+        volume_uuid: volumeUuid,
+        permission: $("attachPermission").value
       })
     });
-    showAlert("Group attached to volume share");
-    if (selectedGroup) await viewGroup(selectedGroup.sid);
+    showAlert("NTFS permission attached to volume");
+    await viewGroup(sid);
+  } catch (e) { showAlert(e.message, true); }
+}
+
+async function detachGroupVolume(sid, volumeUuid, userOrGroup) {
+  if (!confirm(`Remove '${userOrGroup}' from this volume ACL?`)) return;
+  try {
+    let url = `/api/groups/${encodeURIComponent(sid)}/volume-permissions?svm=${svm()}&volume_uuid=${encodeURIComponent(volumeUuid)}`;
+    if (userOrGroup) url += `&user_or_group=${encodeURIComponent(userOrGroup)}`;
+    await api(url, { method: "DELETE" });
+    showAlert("Permission removed");
+    await viewGroup(sid);
   } catch (e) { showAlert(e.message, true); }
 }
 
@@ -323,13 +375,11 @@ function editGroup(sid) {
       <label>Group name<input id="editName" value="${escapeHtml(g.name)}" required maxlength="256"></label>
       <label>Description<textarea id="editDescription" maxlength="1024">${escapeHtml(g.description || "")}</textarea></label>
       <label>ONTAP privileges
-        <span class="hint">Loaded on save from current selection</span>
         <select id="editGroupPrivileges" multiple>${privilegeOptions()}</select>
       </label>
       <button class="primary" type="submit">Save</button>
     </form>
   `);
-  // Prefill privileges asynchronously
   api(`/api/groups/${encodeURIComponent(sid)}/privileges?svm=${svm()}`)
     .then(data => {
       const select = $("editGroupPrivileges");
@@ -375,6 +425,7 @@ async function loadVolumes() {
     const data = await api(`/api/volumes?svm=${svm()}`);
     volumes = data.records;
     renderVolumes();
+    await loadAggregates();
   } catch (e) {
     showAlert(e.message, true);
   }
@@ -396,10 +447,11 @@ function renderVolumes() {
   `).join("") || `<tr><td colspan="5" class="muted">No volumes found.</td></tr>`;
 }
 
-function openCreateVolume() {
+async function openCreateVolume() {
+  await loadAggregates();
   const aggOptions = aggregates.map(a =>
     `<option value="${escapeHtml(a.name)}">${escapeHtml(a.name)}</option>`
-  ).join("") || `<option value="">No aggregates found</option>`;
+  ).join("");
 
   openModal("Create Volume", `
     <form onsubmit="createVolume(event)">
@@ -408,14 +460,21 @@ function openCreateVolume() {
         <label>Size<input id="volSize" required placeholder="10GB" value="10GB"></label>
       </div>
       <label>Aggregate
-        <select id="volAggregate" required>${aggOptions}</select>
+        <select id="volAggregate">
+          ${aggOptions || ""}
+          ${aggOptions ? "" : `<option value="">No aggregates discovered — type below</option>`}
+        </select>
+      </label>
+      <label>Aggregate (manual override)
+        <input id="volAggregateManual" placeholder="e.g. aggr1 — used if dropdown is empty">
+        <span class="hint">On FSx, aggregates are often not listed by API; enter the aggregate used by existing volumes.</span>
       </label>
       <div class="grid-2">
-        <label>Junction path<input id="volPath" placeholder="/volname"></label>
+        <label>Junction path<input id="volPath" placeholder="/Project1"></label>
         <label>Security style
           <select id="volSecurity">
             <option value="">Default</option>
-            <option value="ntfs">ntfs</option>
+            <option value="ntfs" selected>ntfs</option>
             <option value="unix">unix</option>
             <option value="mixed">mixed</option>
           </select>
@@ -430,12 +489,17 @@ function openCreateVolume() {
 async function createVolume(event) {
   event.preventDefault();
   try {
+    const aggregate = ($("volAggregateManual").value || $("volAggregate").value || "").trim();
+    if (!aggregate) {
+      showAlert("Select or enter an aggregate name", true);
+      return;
+    }
     await api(`/api/volumes?svm=${svm()}`, {
       method: "POST",
       body: JSON.stringify({
         name: $("volName").value,
         size: $("volSize").value,
-        aggregate: $("volAggregate").value,
+        aggregate,
         comment: $("volComment").value || null,
         junction_path: $("volPath").value || null,
         security_style: $("volSecurity").value || null
@@ -455,74 +519,70 @@ async function viewVolume(uuid) {
     const v = await api(`/api/volumes/${encodeURIComponent(uuid)}?svm=${svm()}`);
     const groupsAttached = v.attached_groups || [];
     const groupRows = groupsAttached.length
-      ? `<table><thead><tr><th>Group / User</th><th>Share</th><th>Permission</th><th></th></tr></thead><tbody>
+      ? `<table><thead><tr><th>Group / User</th><th>Permission</th><th>Path</th><th></th></tr></thead><tbody>
           ${groupsAttached.map(g => `<tr>
-            <td>${escapeHtml(g.user_or_group || "")}</td>
-            <td>${escapeHtml(g.share || "")}</td>
+            <td><code>${escapeHtml(g.user_or_group || "")}</code></td>
             <td>${escapeHtml(g.permission || "")}</td>
+            <td><code>${escapeHtml(g.path || "")}</code></td>
             <td>
-              <button class="danger small" onclick="removeVolumeAcl('${escapeHtml(uuid)}', '${escapeHtml(g.share)}', '${escapeHtml(g.user_or_group)}', '${escapeHtml(g.type || "windows")}')">Remove</button>
+              <button class="danger small" onclick="removeVolumePermission('${escapeHtml(uuid)}', '${escapeHtml(g.user_or_group)}')">Remove</button>
             </td>
           </tr>`).join("")}
         </tbody></table>`
-      : `<p class="muted">No groups attached via CIFS share ACLs.</p>`;
-
-    const shareOptions = (v.shares || []).map(s =>
-      `<option value="${escapeHtml(s.name)}">${escapeHtml(s.name)} (${escapeHtml(s.path || "")})</option>`
-    ).join("") || `<option value="">No shares on this volume</option>`;
+      : `<p class="muted">No NTFS ACL entries found on this volume path.</p>`;
 
     const groupOptions = groups.map(g =>
       `<option value="${escapeHtml(g.name)}">${escapeHtml(g.name)}</option>`
-    ).join("");
+    ).join("") || `<option value="">No local groups</option>`;
 
     openModal(v.name, `
       <div class="details">
         <p><b>UUID:</b> <code>${escapeHtml(v.uuid)}</code></p>
         <p><b>Size:</b> ${escapeHtml(formatSize(v.size ?? (v.space && v.space.size)))}</p>
         <p><b>State:</b> ${escapeHtml(v.state || "")}</p>
-        <p><b>Junction:</b> <code>${escapeHtml((v.nas && v.nas.path) || "")}</code></p>
+        <p><b>Junction:</b> <code>${escapeHtml((v.nas && v.nas.path) || "—")}</code></p>
+        <p><b>Security style:</b> ${escapeHtml((v.nas && v.nas.security_style) || v.security_style || "")}</p>
         <p><b>Comment:</b> ${escapeHtml(v.comment || "")}</p>
       </div>
 
       <div class="section-block">
-        <h3>Attached groups (share ACLs)</h3>
+        <h3>Attached groups (NTFS file-security ACL)</h3>
         ${groupRows}
-        <form class="inline-form" onsubmit="attachAclToVolume(event, '${escapeHtml(uuid)}')">
-          <label>Share<select id="volShare" required>${shareOptions}</select></label>
+        ${!(v.nas && v.nas.path) ? `<p class="hint">This volume has no junction path — set one before attaching group permissions.</p>` : `
+        <form class="inline-form" onsubmit="attachVolumePermission(event, '${escapeHtml(uuid)}')">
           <label>Group<select id="volGroup" required>${groupOptions}</select></label>
-          <label>Permission<select id="volPermission" required>${permissionOptions("read")}</select></label>
+          <label>Permission<select id="volPermission" required>${ntfsPermissionOptions("modify")}</select></label>
           <button class="primary" type="submit">Attach group</button>
         </form>
-        <p class="hint">If no share exists yet, create a CIFS share in ONTAP that points at this volume first.</p>
+        <p class="hint">Applies <code>CIFS_SERVER\\group</code> with Modify or Read-and-Execute rights on the junction path.</p>`}
       </div>
     `);
   } catch (e) { showAlert(e.message, true); }
 }
 
-async function attachAclToVolume(event, uuid) {
+async function attachVolumePermission(event, uuid) {
   event.preventDefault();
   try {
-    await api(`/api/volumes/${encodeURIComponent(uuid)}/acls?svm=${svm()}&share=${encodeURIComponent($("volShare").value)}`, {
+    await api(`/api/volumes/${encodeURIComponent(uuid)}/permissions?svm=${svm()}`, {
       method: "POST",
       body: JSON.stringify({
-        user_or_group: $("volGroup").value,
-        permission: $("volPermission").value,
-        type: "windows"
+        group_name: $("volGroup").value,
+        permission: $("volPermission").value
       })
     });
-    showAlert("Group attached");
+    showAlert("Group permission attached");
     await viewVolume(uuid);
   } catch (e) { showAlert(e.message, true); }
 }
 
-async function removeVolumeAcl(uuid, share, userOrGroup, aclType) {
-  if (!confirm(`Remove '${userOrGroup}' from share '${share}'?`)) return;
+async function removeVolumePermission(uuid, userOrGroup) {
+  if (!confirm(`Remove '${userOrGroup}' from this volume ACL?`)) return;
   try {
     await api(
-      `/api/volumes/${encodeURIComponent(uuid)}/acls?svm=${svm()}&share=${encodeURIComponent(share)}&user_or_group=${encodeURIComponent(userOrGroup)}&acl_type=${encodeURIComponent(aclType || "windows")}`,
+      `/api/volumes/${encodeURIComponent(uuid)}/permissions?svm=${svm()}&user_or_group=${encodeURIComponent(userOrGroup)}`,
       { method: "DELETE" }
     );
-    showAlert("ACL removed");
+    showAlert("ACL entry removed");
     await viewVolume(uuid);
   } catch (e) { showAlert(e.message, true); }
 }
@@ -586,7 +646,10 @@ async function deleteVolume(uuid, name) {
   } catch (e) { showAlert(e.message, true); }
 }
 
-$("svm").addEventListener("change", () => {
+$("svm").addEventListener("change", async () => {
+  volumes = [];
+  aggregates = [];
+  await loadAggregates();
   if (currentSection === "volumes") loadVolumes();
   else loadGroups();
 });
@@ -596,7 +659,7 @@ $("svm").addEventListener("change", () => {
     await loadSvms();
     await loadMeta();
     await loadGroups();
-    // Prefetch groups list for volume ACL dropdowns
+    await ensureVolumesLoaded();
   } catch (e) {
     showAlert(e.message, true);
   }

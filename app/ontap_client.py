@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import time
 from typing import Any
 from urllib.parse import quote
 
@@ -34,12 +36,50 @@ AVAILABLE_PRIVILEGES = [
     },
 ]
 
-SHARE_PERMISSIONS = [
-    {"value": "full_control", "label": "Full control"},
-    {"value": "change", "label": "Change"},
-    {"value": "read", "label": "Read"},
-    {"value": "no_access", "label": "No access"},
+# NTFS path permission presets from FSx_Permissions.docx (Project RW / Project RO).
+NTFS_PERMISSION_PRESETS = [
+    {
+        "value": "modify",
+        "label": "Modify (Read/Write)",
+        "advanced_rights": {
+            "read_data": True,
+            "read_attr": True,
+            "read_ea": True,
+            "read_perm": True,
+            "execute_file": True,
+            "write_data": True,
+            "append_data": True,
+            "write_attr": True,
+            "write_ea": True,
+            "delete": True,
+            "delete_child": True,
+            "synchronize": True,
+        },
+    },
+    {
+        "value": "read_and_execute",
+        "label": "Read and Execute (Read-Only)",
+        "advanced_rights": {
+            "read_data": True,
+            "read_attr": True,
+            "read_ea": True,
+            "read_perm": True,
+            "execute_file": True,
+            "synchronize": True,
+        },
+    },
+    {
+        "value": "full_control",
+        "label": "Full control",
+        "advanced_rights": {"full_control": True},
+    },
 ]
+
+APPLY_TO_ALL = {
+    "this_folder": True,
+    "sub_folders": True,
+    "files": True,
+}
 
 
 class OntapApiError(Exception):
@@ -96,6 +136,29 @@ class OntapClient:
         except Exception:
             return {"raw": response.text}
 
+    async def wait_job(self, job_uuid: str, timeout: float = 90.0) -> dict:
+        deadline = time.monotonic() + timeout
+        while True:
+            data = await self._request("GET", f"/cluster/jobs/{quote(job_uuid, safe='')}")
+            state = (data or {}).get("state")
+            if state in ("success", "failure", "error"):
+                if state != "success":
+                    msg = (data or {}).get("message") or f"ONTAP job {job_uuid} ended with {state}"
+                    raise OntapApiError(500, msg, data)
+                return data or {}
+            if time.monotonic() >= deadline:
+                raise OntapApiError(504, f"Timed out waiting for ONTAP job {job_uuid}")
+            await asyncio.sleep(1.0)
+
+    async def _request_job(self, method: str, path: str, **kwargs) -> Any:
+        data = await self._request(method, path, **kwargs)
+        if isinstance(data, dict):
+            job = data.get("job") or {}
+            job_uuid = job.get("uuid")
+            if job_uuid:
+                await self.wait_job(job_uuid)
+        return data
+
     async def list_svms(self) -> list[dict]:
         data = await self._request(
             "GET",
@@ -114,6 +177,46 @@ class OntapClient:
         if not records:
             raise OntapApiError(404, f"SVM '{svm_name}' was not found")
         return records[0]
+
+    async def get_cifs_server(self, svm_name: str) -> dict:
+        """Return CIFS/SMB server for the SVM (NetBIOS name used as local domain)."""
+        if self.settings.cifs_local_domain:
+            return {"name": self.settings.cifs_local_domain, "svm": {"name": svm_name}}
+        svm = await self.resolve_svm(svm_name)
+        data = await self._request(
+            "GET",
+            "/protocols/cifs/services",
+            params={
+                "svm.uuid": svm["uuid"],
+                "fields": "name,svm,ad_domain,enabled",
+                "max_records": 10,
+            },
+        )
+        records = data.get("records", [])
+        if not records:
+            raise OntapApiError(
+                404,
+                f"No CIFS/SMB server found for SVM '{svm_name}'. "
+                "Set CIFS_LOCAL_DOMAIN in .env or create a CIFS server.",
+            )
+        return records[0]
+
+    @staticmethod
+    def local_group_account(cifs_server: str, group_name: str) -> str:
+        """Build DOMAIN\\group as required by file-security ACL user field."""
+        short = (group_name or "").split("\\")[-1].strip()
+        domain = (cifs_server or "").split("\\")[0].strip()
+        if not short:
+            raise OntapApiError(400, "Group name is required")
+        if not domain:
+            raise OntapApiError(400, "CIFS server / local domain is required")
+        return f"{domain}\\{short}"
+
+    @staticmethod
+    def encode_fs_path(path: str) -> str:
+        if not path.startswith("/"):
+            path = "/" + path
+        return quote(path, safe="")
 
     async def list_groups(self, svm_name: str) -> list[dict]:
         svm = await self.resolve_svm(svm_name)
@@ -153,7 +256,6 @@ class OntapClient:
 
         data = await self._request("POST", "/protocols/cifs/local-groups", json=body)
 
-        # ONTAP may return 201 without a complete resource. Resolve by name.
         if isinstance(data, dict) and data.get("sid"):
             return data
         groups = await self.list_groups(svm_name)
@@ -203,7 +305,6 @@ class OntapClient:
 
     async def add_member(self, svm_name: str, sid: str, member: str) -> None:
         svm = await self.resolve_svm(svm_name)
-        # Path already includes svm.uuid and sid — body must only contain the member name.
         path = (
             f"/protocols/cifs/local-groups/"
             f"{quote(svm['uuid'], safe='')}/{quote(sid, safe='')}/members"
@@ -219,7 +320,7 @@ class OntapClient:
         )
         await self._request("DELETE", path)
 
-    # ---- Privileges ----
+    # ---- Privileges (optional Se* privileges) ----
 
     async def get_privileges(self, svm_name: str, name: str) -> list[str]:
         svm = await self.resolve_svm(svm_name)
@@ -248,7 +349,6 @@ class OntapClient:
             f"{quote(svm['uuid'], safe='')}/{quote(name, safe='')}"
         )
         body = {"privileges": privileges}
-        # PATCH replaces the privilege set. If no record exists yet, POST creates it.
         try:
             await self._request("PATCH", path, json=body)
         except OntapApiError as exc:
@@ -269,6 +369,31 @@ class OntapClient:
             params={"fields": "name,uuid,state,space.available,space.size", "max_records": 1000},
         )
         return data.get("records", [])
+
+    async def list_aggregates_for_svm(self, svm_name: str) -> list[dict]:
+        """
+        FSx often hides cluster aggregates from SVM-scoped accounts.
+        Prefer aggregates discovered from existing volumes on the SVM.
+        """
+        found: dict[str, dict] = {}
+        try:
+            for agg in await self.list_aggregates():
+                name = agg.get("name")
+                if name:
+                    found[name] = agg
+        except OntapApiError:
+            pass
+
+        try:
+            for volume in await self.list_volumes(svm_name):
+                for agg in volume.get("aggregates") or []:
+                    name = agg.get("name") if isinstance(agg, dict) else None
+                    if name and name not in found:
+                        found[name] = {"name": name, "uuid": agg.get("uuid")}
+        except OntapApiError:
+            pass
+
+        return sorted(found.values(), key=lambda a: a.get("name") or "")
 
     async def list_volumes(self, svm_name: str) -> list[dict]:
         svm = await self.resolve_svm(svm_name)
@@ -329,8 +454,7 @@ class OntapClient:
         if nas:
             body["nas"] = nas
 
-        data = await self._request("POST", "/storage/volumes", json=body)
-        # Volume create is often async; try to resolve by name afterwards.
+        data = await self._request_job("POST", "/storage/volumes", json=body)
         try:
             volumes = await self.list_volumes(svm_name)
             matches = [v for v in volumes if v.get("name") == name]
@@ -364,158 +488,205 @@ class OntapClient:
         if nas:
             body["nas"] = nas
         if body:
-            await self._request("PATCH", f"/storage/volumes/{quote(uuid, safe='')}", json=body)
+            await self._request_job("PATCH", f"/storage/volumes/{quote(uuid, safe='')}", json=body)
         return await self.get_volume(uuid)
 
     async def delete_volume(self, uuid: str) -> None:
-        await self._request("DELETE", f"/storage/volumes/{quote(uuid, safe='')}")
+        await self._request_job("DELETE", f"/storage/volumes/{quote(uuid, safe='')}")
 
-    # ---- CIFS shares / ACLs (group <-> volume linkage) ----
+    # ---- File-security (NTFS) permissions on volume junction paths ----
 
-    async def list_shares(self, svm_name: str) -> list[dict]:
+    def _preset(self, permission: str) -> dict:
+        for preset in NTFS_PERMISSION_PRESETS:
+            if preset["value"] == permission:
+                return preset
+        raise OntapApiError(
+            400,
+            f"Unknown permission '{permission}'. Use: "
+            + ", ".join(p["value"] for p in NTFS_PERMISSION_PRESETS),
+        )
+
+    async def get_path_permissions(self, svm_name: str, path: str) -> dict:
         svm = await self.resolve_svm(svm_name)
-        data = await self._request(
-            "GET",
-            "/protocols/cifs/shares",
-            params={
-                "svm.uuid": svm["uuid"],
-                "fields": "name,path,volume,svm,comment",
-                "max_records": 1000,
-            },
+        api_path = (
+            f"/protocols/file-security/permissions/"
+            f"{quote(svm['uuid'], safe='')}/{self.encode_fs_path(path)}"
         )
-        records = data.get("records", [])
-        for record in records:
-            record.setdefault("svm", svm)
-        return records
+        try:
+            return await self._request(
+                "GET",
+                api_path,
+                params={"lookup_names": "true"},
+            ) or {}
+        except OntapApiError as exc:
+            if exc.status_code == 404:
+                return {"acls": [], "path": path}
+            raise
 
-    async def list_share_acls(self, svm_name: str, share: str) -> list[dict]:
-        svm = await self.resolve_svm(svm_name)
-        path = (
-            f"/protocols/cifs/shares/"
-            f"{quote(svm['uuid'], safe='')}/{quote(share, safe='')}/acls"
-        )
-        data = await self._request(
-            "GET",
-            path,
-            params={"fields": "user_or_group,permission,type,sid", "max_records": 1000},
-        )
-        return data.get("records", [])
-
-    async def add_share_acl(
+    async def add_path_acl(
         self,
         svm_name: str,
-        share: str,
-        user_or_group: str,
+        path: str,
+        user: str,
         permission: str,
-        acl_type: str = "windows",
-    ) -> None:
+    ) -> Any:
         svm = await self.resolve_svm(svm_name)
-        path = (
-            f"/protocols/cifs/shares/"
-            f"{quote(svm['uuid'], safe='')}/{quote(share, safe='')}/acls"
+        preset = self._preset(permission)
+        api_path = (
+            f"/protocols/file-security/permissions/"
+            f"{quote(svm['uuid'], safe='')}/{self.encode_fs_path(path)}/acl"
         )
-        await self._request(
+        body: dict[str, Any] = {
+            "access": "access_allow",
+            "access_control": "file_directory",
+            "user": user,
+            "advanced_rights": preset["advanced_rights"],
+            "apply_to": APPLY_TO_ALL,
+            "propagation_mode": "propogate",
+        }
+        return await self._request_job(
             "POST",
-            path,
-            json={
-                "user_or_group": user_or_group,
-                "permission": permission,
-                "type": acl_type,
-            },
+            api_path,
+            params={"return_timeout": 0},
+            json=body,
         )
 
-    async def update_share_acl(
-        self,
-        svm_name: str,
-        share: str,
-        user_or_group: str,
-        permission: str,
-        acl_type: str = "windows",
-    ) -> None:
+    async def remove_path_acl(self, svm_name: str, path: str, user: str) -> Any:
         svm = await self.resolve_svm(svm_name)
-        path = (
-            f"/protocols/cifs/shares/"
-            f"{quote(svm['uuid'], safe='')}/{quote(share, safe='')}/acls/"
-            f"{quote(user_or_group, safe='')}/{quote(acl_type, safe='')}"
+        api_path = (
+            f"/protocols/file-security/permissions/"
+            f"{quote(svm['uuid'], safe='')}/{self.encode_fs_path(path)}/acl/"
+            f"{quote(user, safe='')}"
         )
-        await self._request("PATCH", path, json={"permission": permission})
-
-    async def remove_share_acl(
-        self,
-        svm_name: str,
-        share: str,
-        user_or_group: str,
-        acl_type: str = "windows",
-    ) -> None:
-        svm = await self.resolve_svm(svm_name)
-        path = (
-            f"/protocols/cifs/shares/"
-            f"{quote(svm['uuid'], safe='')}/{quote(share, safe='')}/acls/"
-            f"{quote(user_or_group, safe='')}/{quote(acl_type, safe='')}"
+        body = {
+            "access": "access_allow",
+            "access_control": "file_directory",
+            "apply_to": APPLY_TO_ALL,
+            "propagation_mode": "propogate",
+        }
+        return await self._request_job(
+            "DELETE",
+            api_path,
+            params={"return_timeout": 0},
+            json=body,
         )
-        await self._request("DELETE", path)
 
-    async def volume_attached_groups(self, svm_name: str, volume_name: str) -> list[dict]:
-        """Groups (and users) attached to a volume via CIFS share ACLs."""
-        shares = await self.list_shares(svm_name)
+    @staticmethod
+    def _summarize_ace(ace: dict) -> str:
+        if ace.get("rights"):
+            return str(ace["rights"])
+        adv = ace.get("advanced_rights") or {}
+        if adv.get("full_control"):
+            return "full_control"
+        write_like = any(
+            adv.get(k)
+            for k in ("write_data", "append_data", "delete", "delete_child", "write_attr", "write_ea")
+        )
+        read_like = any(
+            adv.get(k) for k in ("read_data", "read_attr", "execute_file", "read_perm")
+        )
+        if write_like and read_like:
+            return "modify"
+        if read_like:
+            return "read_and_execute"
+        return "custom"
+
+    @staticmethod
+    def _names_match(account: str, candidates: set[str]) -> bool:
+        account_l = (account or "").lower()
+        short = account_l.split("\\")[-1]
+        return account_l in candidates or short in candidates
+
+    async def volume_attached_groups(self, svm_name: str, volume: dict) -> list[dict]:
+        path = ((volume.get("nas") or {}).get("path")) or None
+        if not path:
+            return []
+        perms = await self.get_path_permissions(svm_name, path)
         attached: list[dict] = []
-        for share in shares:
-            vol = share.get("volume") or {}
-            share_vol_name = vol.get("name") if isinstance(vol, dict) else None
-            if share_vol_name != volume_name:
-                continue
-            try:
-                acls = await self.list_share_acls(svm_name, share["name"])
-            except OntapApiError:
-                continue
-            for acl in acls:
-                attached.append(
-                    {
-                        "share": share.get("name"),
-                        "path": share.get("path"),
-                        "user_or_group": acl.get("user_or_group"),
-                        "permission": acl.get("permission"),
-                        "type": acl.get("type"),
-                        "sid": acl.get("sid"),
-                    }
-                )
+        for ace in perms.get("acls") or []:
+            user = ace.get("user") or ace.get("access_control") or ""
+            if not user or str(user).upper().startswith("BUILTIN\\"):
+                # Still show BUILTIN entries so admins can see them
+                pass
+            attached.append(
+                {
+                    "user_or_group": ace.get("user"),
+                    "access": ace.get("access"),
+                    "permission": self._summarize_ace(ace),
+                    "path": path,
+                    "volume": volume.get("name"),
+                    "volume_uuid": volume.get("uuid"),
+                    "apply_to": ace.get("apply_to"),
+                }
+            )
         return attached
 
-    async def group_attached_volumes(self, svm_name: str, group_name: str, sid: str | None = None) -> list[dict]:
-        """Volumes/shares where this group appears in a share ACL."""
-        shares = await self.list_shares(svm_name)
-        group_names = {group_name.lower()}
-        # Local groups are often referenced as GROUP or CIFS_SERVER\GROUP
-        if "\\" in group_name:
-            group_names.add(group_name.split("\\", 1)[-1].lower())
-        else:
-            group_names.add(group_name.lower())
+    async def group_attached_volumes(self, svm_name: str, group_name: str) -> list[dict]:
+        cifs = await self.get_cifs_server(svm_name)
+        account = self.local_group_account(cifs["name"], group_name)
+        short = group_name.split("\\")[-1]
+        candidates = {account.lower(), short.lower(), group_name.lower()}
 
         attached: list[dict] = []
-        for share in shares:
+        for volume in await self.list_volumes(svm_name):
+            path = (volume.get("nas") or {}).get("path")
+            if not path:
+                continue
             try:
-                acls = await self.list_share_acls(svm_name, share["name"])
+                perms = await self.get_path_permissions(svm_name, path)
             except OntapApiError:
                 continue
-            for acl in acls:
-                name = (acl.get("user_or_group") or "").lower()
-                short = name.split("\\", 1)[-1] if "\\" in name else name
-                acl_sid = acl.get("sid")
-                match = name in group_names or short in group_names
-                if sid and acl_sid and acl_sid == sid:
-                    match = True
-                if not match:
+            for ace in perms.get("acls") or []:
+                user = ace.get("user") or ""
+                if not self._names_match(user, candidates):
                     continue
-                vol = share.get("volume") or {}
                 attached.append(
                     {
-                        "share": share.get("name"),
-                        "path": share.get("path"),
-                        "volume": vol.get("name") if isinstance(vol, dict) else None,
-                        "volume_uuid": vol.get("uuid") if isinstance(vol, dict) else None,
-                        "permission": acl.get("permission"),
-                        "user_or_group": acl.get("user_or_group"),
-                        "type": acl.get("type"),
+                        "volume": volume.get("name"),
+                        "volume_uuid": volume.get("uuid"),
+                        "path": path,
+                        "user_or_group": user,
+                        "permission": self._summarize_ace(ace),
+                        "access": ace.get("access"),
                     }
                 )
         return attached
+
+    async def attach_group_to_volume(
+        self,
+        svm_name: str,
+        volume_uuid: str,
+        group_name: str,
+        permission: str,
+    ) -> dict:
+        volume = await self.get_volume(volume_uuid)
+        path = (volume.get("nas") or {}).get("path")
+        if not path:
+            raise OntapApiError(
+                400,
+                f"Volume '{volume.get('name')}' has no junction path. "
+                "Set a junction path before attaching NTFS permissions.",
+            )
+        cifs = await self.get_cifs_server(svm_name)
+        account = self.local_group_account(cifs["name"], group_name)
+        await self.add_path_acl(svm_name, path, account, permission)
+        return {
+            "volume": volume.get("name"),
+            "volume_uuid": volume_uuid,
+            "path": path,
+            "user_or_group": account,
+            "permission": permission,
+            "cifs_server": cifs.get("name"),
+        }
+
+    async def detach_group_from_volume(
+        self,
+        svm_name: str,
+        volume_uuid: str,
+        user_or_group: str,
+    ) -> None:
+        volume = await self.get_volume(volume_uuid)
+        path = (volume.get("nas") or {}).get("path")
+        if not path:
+            raise OntapApiError(400, "Volume has no junction path")
+        await self.remove_path_acl(svm_name, path, user_or_group)

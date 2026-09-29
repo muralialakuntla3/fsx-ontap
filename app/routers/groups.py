@@ -1,8 +1,8 @@
 from fastapi import APIRouter, HTTPException, Query
 
 from app.config import get_settings
-from app.models import GroupCreate, GroupUpdate, MemberAdd, PrivilegesUpdate
-from app.ontap_client import AVAILABLE_PRIVILEGES, OntapApiError, OntapClient
+from app.models import GroupCreate, GroupUpdate, MemberAdd, PrivilegesUpdate, VolumePermissionAttach
+from app.ontap_client import AVAILABLE_PRIVILEGES, NTFS_PERMISSION_PRESETS, OntapApiError, OntapClient
 
 router = APIRouter(prefix="/groups", tags=["groups"])
 
@@ -18,6 +18,24 @@ def handle_error(exc: OntapApiError):
 @router.get("/meta/privileges")
 async def list_available_privileges():
     return {"records": AVAILABLE_PRIVILEGES}
+
+
+@router.get("/meta/permissions")
+async def list_ntfs_permissions():
+    return {
+        "records": [
+            {"value": p["value"], "label": p["label"]} for p in NTFS_PERMISSION_PRESETS
+        ]
+    }
+
+
+@router.get("/meta/cifs-server")
+async def get_cifs_server(svm: str = Query(...)):
+    try:
+        cifs = await client().get_cifs_server(svm)
+        return {"name": cifs.get("name"), "svm": cifs.get("svm")}
+    except OntapApiError as exc:
+        handle_error(exc)
 
 
 @router.get("")
@@ -37,6 +55,10 @@ async def create_group(svm: str, payload: GroupCreate):
             group["privileges"] = await c.set_privileges(svm, group["name"], payload.privileges)
         else:
             group["privileges"] = []
+        if payload.volume_uuid and payload.permission:
+            group["volume_permission"] = await c.attach_group_to_volume(
+                svm, payload.volume_uuid, group["name"], payload.permission
+            )
         return group
     except OntapApiError as exc:
         handle_error(exc)
@@ -49,9 +71,14 @@ async def get_group(svm: str, sid: str):
         group = await c.get_group(svm, sid)
         group["members"] = await c.list_members(svm, sid)
         group["privileges"] = await c.get_privileges(svm, group["name"])
-        group["attached_volumes"] = await c.group_attached_volumes(
-            svm, group["name"], group.get("sid")
-        )
+        try:
+            cifs = await c.get_cifs_server(svm)
+            group["cifs_server"] = cifs.get("name")
+            group["local_account"] = c.local_group_account(cifs["name"], group["name"])
+        except OntapApiError:
+            group["cifs_server"] = None
+            group["local_account"] = group["name"]
+        group["attached_volumes"] = await c.group_attached_volumes(svm, group["name"])
         return group
     except OntapApiError as exc:
         handle_error(exc)
@@ -123,5 +150,39 @@ async def update_group_privileges(svm: str, sid: str, payload: PrivilegesUpdate)
         group = await c.get_group(svm, sid)
         privileges = await c.set_privileges(svm, group["name"], payload.privileges)
         return {"name": group["name"], "privileges": privileges}
+    except OntapApiError as exc:
+        handle_error(exc)
+
+
+@router.post("/{sid}/volume-permissions", status_code=201)
+async def attach_group_volume_permission(svm: str, sid: str, payload: VolumePermissionAttach):
+    try:
+        if not payload.volume_uuid:
+            raise HTTPException(status_code=400, detail="volume_uuid is required")
+        c = client()
+        group = await c.get_group(svm, sid)
+        return await c.attach_group_to_volume(
+            svm, payload.volume_uuid, group["name"], payload.permission
+        )
+    except OntapApiError as exc:
+        handle_error(exc)
+
+
+@router.delete("/{sid}/volume-permissions")
+async def detach_group_volume_permission(
+    svm: str,
+    sid: str,
+    volume_uuid: str = Query(...),
+    user_or_group: str | None = Query(None),
+):
+    try:
+        c = client()
+        group = await c.get_group(svm, sid)
+        account = user_or_group
+        if not account:
+            cifs = await c.get_cifs_server(svm)
+            account = c.local_group_account(cifs["name"], group["name"])
+        await c.detach_group_from_volume(svm, volume_uuid, account)
+        return {"message": f"Removed '{account}' from volume"}
     except OntapApiError as exc:
         handle_error(exc)

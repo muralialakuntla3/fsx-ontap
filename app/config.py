@@ -9,6 +9,8 @@ class Settings(BaseSettings):
     ontap_verify_ssl: bool = True
     ontap_timeout: float = 30.0
     default_svm: str | None = None
+    # Optional override for local SMB domain (CIFS server NetBIOS name), e.g. CAPESVM2
+    cifs_local_domain: str | None = None
     app_title: str = "FSx ONTAP Local Group Manager"
 
     model_config = SettingsConfigDict(

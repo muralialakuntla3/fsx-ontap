@@ -10,6 +10,12 @@ class GroupCreate(BaseModel):
     name: str = Field(min_length=1, max_length=256)
     description: str | None = Field(default=None, max_length=1024)
     privileges: list[str] = Field(default_factory=list)
+    # Optional: attach NTFS permission to a volume junction path on create
+    volume_uuid: str | None = None
+    permission: str | None = Field(
+        default=None,
+        description="NTFS preset: modify | read_and_execute | full_control",
+    )
 
 
 class GroupUpdate(BaseModel):
@@ -58,11 +64,11 @@ class VolumeUpdate(BaseModel):
     security_style: str | None = None
 
 
-class ShareAclCreate(BaseModel):
+class VolumePermissionAttach(BaseModel):
+    volume_uuid: str | None = None
+    group_name: str | None = Field(default=None, max_length=256)
+    permission: str = Field(min_length=1, description="modify | read_and_execute | full_control")
+
+
+class VolumePermissionDetach(BaseModel):
     user_or_group: str = Field(min_length=1, max_length=1024)
-    permission: str = Field(min_length=1)
-    type: str = Field(default="windows")
-
-
-class ShareAclUpdate(BaseModel):
-    permission: str = Field(min_length=1)
