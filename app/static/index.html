@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FSx ONTAP Local Group Manager</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <div>
+    <h1>FSx ONTAP Local Group Manager</h1>
+    <p>CIFS local groups, AD users/groups and local users</p>
+  </div>
+  <a href="/docs" target="_blank">API Docs</a>
+</header>
+
+<main>
+  <section class="toolbar">
+    <label>SVM
+      <select id="svm"></select>
+    </label>
+    <button onclick="loadGroups()">Refresh</button>
+    <button class="primary" onclick="openCreate()">+ Create Group</button>
+  </section>
+
+  <div id="alert"></div>
+
+  <section class="card">
+    <table>
+      <thead>
+        <tr><th>Group</th><th>Description</th><th>SID</th><th>Actions</th></tr>
+      </thead>
+      <tbody id="groups"></tbody>
+    </table>
+  </section>
+</main>
+
+<div id="modal" class="modal hidden">
+  <div class="dialog">
+    <div class="dialog-head">
+      <h2 id="modalTitle"></h2>
+      <button onclick="closeModal()">×</button>
+    </div>
+    <div id="modalBody"></div>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
