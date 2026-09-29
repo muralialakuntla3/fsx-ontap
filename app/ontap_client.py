@@ -37,6 +37,7 @@ AVAILABLE_PRIVILEGES = [
 ]
 
 # NTFS path permission presets from FSx_Permissions.docx (Project RW / Project RO).
+# Note: do not include "synchronize" — some FSx/ONTAP builds reject it.
 NTFS_PERMISSION_PRESETS = [
     {
         "value": "modify",
@@ -53,7 +54,6 @@ NTFS_PERMISSION_PRESETS = [
             "write_ea": True,
             "delete": True,
             "delete_child": True,
-            "synchronize": True,
         },
     },
     {
@@ -65,7 +65,6 @@ NTFS_PERMISSION_PRESETS = [
             "read_ea": True,
             "read_perm": True,
             "execute_file": True,
-            "synchronize": True,
         },
     },
     {
@@ -202,6 +201,10 @@ class OntapClient:
         return records[0]
 
     @staticmethod
+    def short_name(name: str) -> str:
+        return (name or "").split("\\")[-1].strip().lower()
+
+    @staticmethod
     def local_group_account(cifs_server: str, group_name: str) -> str:
         """Build DOMAIN\\group as required by file-security ACL user field."""
         short = (group_name or "").split("\\")[-1].strip()
@@ -234,6 +237,33 @@ class OntapClient:
             record.setdefault("svm", svm)
         return records
 
+    async def find_group_by_name(self, svm_name: str, name: str) -> dict | None:
+        wanted = self.short_name(name)
+        # Prefer server-side name filter first, then fall back to full list match.
+        svm = await self.resolve_svm(svm_name)
+        try:
+            data = await self._request(
+                "GET",
+                "/protocols/cifs/local-groups",
+                params={
+                    "svm.uuid": svm["uuid"],
+                    "name": name,
+                    "fields": "name,description,sid,svm",
+                    "max_records": 100,
+                },
+            )
+            records = data.get("records", [])
+            for record in records:
+                if self.short_name(record.get("name", "")) == wanted:
+                    record.setdefault("svm", svm)
+                    return record
+        except OntapApiError:
+            pass
+
+        groups = await self.list_groups(svm_name)
+        matches = [g for g in groups if self.short_name(g.get("name", "")) == wanted]
+        return matches[0] if matches else None
+
     async def get_group(self, svm_name: str, sid: str) -> dict:
         svm = await self.resolve_svm(svm_name)
         path = f"/protocols/cifs/local-groups/{quote(svm['uuid'], safe='')}/{quote(sid, safe='')}"
@@ -254,15 +284,28 @@ class OntapClient:
         if description is not None:
             body["description"] = description
 
-        data = await self._request("POST", "/protocols/cifs/local-groups", json=body)
+        data = await self._request(
+            "POST",
+            "/protocols/cifs/local-groups",
+            params={"return_records": "true"},
+            json=body,
+        )
 
-        if isinstance(data, dict) and data.get("sid"):
-            return data
-        groups = await self.list_groups(svm_name)
-        matches = [g for g in groups if g.get("name", "").lower() == name.lower()]
-        if not matches:
+        if isinstance(data, dict):
+            if data.get("sid"):
+                return data
+            records = data.get("records") or []
+            if records and records[0].get("sid"):
+                return records[0]
+
+        found = await self.find_group_by_name(svm_name, name)
+        if not found:
+            # Brief delay — ONTAP sometimes indexes the new group slightly later.
+            await asyncio.sleep(1.0)
+            found = await self.find_group_by_name(svm_name, name)
+        if not found:
             raise OntapApiError(500, "Group was created but could not be retrieved")
-        return matches[0]
+        return found
 
     async def update_group(
         self,
@@ -309,10 +352,18 @@ class OntapClient:
             f"/protocols/cifs/local-groups/"
             f"{quote(svm['uuid'], safe='')}/{quote(sid, safe='')}/members"
         )
-        await self._request("POST", path, json={"name": member})
+        try:
+            await self._request("POST", path, json={"name": member})
+        except OntapApiError as exc:
+            # Already a member — treat as success so UI can refresh cleanly.
+            msg = (exc.message or "").lower()
+            if exc.status_code in (409, 400) and ("duplicate" in msg or "already" in msg):
+                return
+            raise
 
     async def remove_member(self, svm_name: str, sid: str, member: str) -> None:
         svm = await self.resolve_svm(svm_name)
+        # Preserve DOMAIN\user exactly in the path.
         path = (
             f"/protocols/cifs/local-groups/"
             f"{quote(svm['uuid'], safe='')}/{quote(sid, safe='')}/members/"
@@ -542,7 +593,7 @@ class OntapClient:
             "user": user,
             "advanced_rights": preset["advanced_rights"],
             "apply_to": APPLY_TO_ALL,
-            "propagation_mode": "propogate",
+            "propagation_mode": "propagate",
         }
         return await self._request_job(
             "POST",
@@ -562,7 +613,7 @@ class OntapClient:
             "access": "access_allow",
             "access_control": "file_directory",
             "apply_to": APPLY_TO_ALL,
-            "propagation_mode": "propogate",
+            "propagation_mode": "propagate",
         }
         return await self._request_job(
             "DELETE",

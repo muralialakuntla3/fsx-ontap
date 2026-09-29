@@ -36,6 +36,15 @@ function escapeHtml(value) {
   );
 }
 
+// Safe value for use inside single-quoted JS in HTML onclick handlers.
+// Preserves DOMAIN\user backslashes (escapeHtml alone is not enough).
+function q(value) {
+  return encodeURIComponent(String(value ?? ""));
+}
+function uq(value) {
+  return decodeURIComponent(String(value ?? ""));
+}
+
 function svm() {
   return encodeURIComponent($("svm").value);
 }
@@ -239,7 +248,7 @@ async function viewGroup(sid) {
             <td><code>${escapeHtml(v.user_or_group || "")}</code></td>
             <td>${escapeHtml(v.permission || "")}</td>
             <td>
-              <button class="danger small" onclick="detachGroupVolume('${escapeHtml(g.sid)}', '${escapeHtml(v.volume_uuid)}', '${escapeHtml(v.user_or_group)}')">Remove</button>
+              <button class="danger small" onclick="detachGroupVolume(uq('${q(g.sid)}'), uq('${q(v.volume_uuid)}'), uq('${q(v.user_or_group)}'))">Remove</button>
             </td>
           </tr>`).join("")}
         </tbody></table>`
@@ -297,7 +306,7 @@ function renderMembers(members) {
   if (!members.length) return "<p class='muted'>No members.</p>";
   return `<ul class="members">${members.map(m => `
     <li><span>${escapeHtml(m)}</span>
-      <button class="danger small" onclick="removeMember('${escapeHtml(selectedGroup.sid)}', '${escapeHtml(m)}')">Remove</button>
+      <button class="danger small" onclick="removeMember(uq('${q(selectedGroup.sid)}'), uq('${q(m)}'))">Remove</button>
     </li>`).join("")}</ul>`;
 }
 
@@ -525,7 +534,7 @@ async function viewVolume(uuid) {
             <td>${escapeHtml(g.permission || "")}</td>
             <td><code>${escapeHtml(g.path || "")}</code></td>
             <td>
-              <button class="danger small" onclick="removeVolumePermission('${escapeHtml(uuid)}', '${escapeHtml(g.user_or_group)}')">Remove</button>
+              <button class="danger small" onclick="removeVolumePermission(uq('${q(uuid)}'), uq('${q(g.user_or_group)}'))">Remove</button>
             </td>
           </tr>`).join("")}
         </tbody></table>`
